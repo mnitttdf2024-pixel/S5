@@ -365,13 +365,16 @@ class AdaptiveDampingS5SSM(S5SSM):
                                   lambda rng, shape: np.full(shape, -3.0),
                                   (self.P,))
 
-    def __call__(self, input_sequence):
+    def __call__(self, input_sequence, global_th):
         """
         Compute the LxH output using sequential adaptive-damping scan.
         Args:
             input_sequence (float32): (L, H)
+            global_th: pruning threshold (unused; accepted for API compatibility
+                       with S5SSM which passes this from layers.py)
         Returns:
             output (float32): (L, H)
+            ENERGYscore: None (adaptive damping does not use AIRE scoring)
         """
         ys = apply_ssm_adaptive(
             self.Lambda_bar,
@@ -383,7 +386,7 @@ class AdaptiveDampingS5SSM(S5SSM):
             self.conj_sym,
         )
         Du = jax.vmap(lambda u: self.D * u)(input_sequence)
-        return ys + Du
+        return ys + Du, None
 
 
 def init_AdaptiveDampingS5SSM(H,
@@ -398,10 +401,13 @@ def init_AdaptiveDampingS5SSM(H,
                                dt_max,
                                conj_sym,
                                clip_eigs,
-                               bidirectional):
+                               bidirectional,
+                               pruning=False):
     """Convenience function to initialise AdaptiveDampingS5SSM.
-    Same arguments as init_S5SSM; bidirectional is accepted but ignored
-    (adaptive sequential scan supports forward direction only)."""
+    Same arguments as init_S5SSM; bidirectional and pruning are accepted
+    for API compatibility (pruning is passed through but the adaptive model
+    returns ENERGYscore=None regardless, since damping is the forgetting
+    mechanism)."""
     return partial(AdaptiveDampingS5SSM,
                    H=H,
                    P=P,
@@ -415,7 +421,8 @@ def init_AdaptiveDampingS5SSM(H,
                    dt_max=dt_max,
                    conj_sym=conj_sym,
                    clip_eigs=clip_eigs,
-                   bidirectional=bidirectional)
+                   bidirectional=bidirectional,
+                   pruning=pruning)
 
 
 def init_S5SSM(H,
