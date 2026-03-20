@@ -93,8 +93,8 @@ def train(args):
     print("V.shape={}".format(V.shape))
     print("Vinv.shape={}".format(Vinv.shape))
 
-    ssm_init_cls = init_AdaptiveDampingS5SSM if args.use_adaptive_damping else init_S5SSM
-    if args.use_adaptive_damping:
+    ssm_init_cls = init_AdaptiveDampingS5SSM if args.adaptive_damping else init_S5SSM
+    if args.adaptive_damping:
         print("[*] Using AdaptiveDampingS5SSM (state-regulated damping)")
     ssm_init_fn = ssm_init_cls(H=args.d_model,
                                P=ssm_size,

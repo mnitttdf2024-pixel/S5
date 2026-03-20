@@ -97,7 +97,7 @@ if __name__ == "__main__":
 	  	       "noBCdecay:      no weight decay on B (ssm lr), no weight decay on C (ssm lr) \\")
 	parser.add_argument("--jax_seed", type=int, default=1919,
 						help="seed randomness")
-	parser.add_argument("--use_adaptive_damping", type=str2bool, default=False,
+	parser.add_argument("--adaptive_damping", type=str2bool, default=False,
 						help="Use AdaptiveDampingS5SSM (state-regulated damping) "
 							 "instead of vanilla S5SSM. Adds a small (P x 3) "
 							 "controller that adjusts per-state forgetting strength "
