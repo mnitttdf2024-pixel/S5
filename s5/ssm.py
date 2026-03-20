@@ -247,6 +247,177 @@ class S5SSM(nn.Module):
         return ys + Du
 
 
+def apply_ssm_adaptive(Lambda_bar, B_bar, C_tilde, W_adapt, b_adapt,
+                       input_sequence, conj_sym):
+    """Compute the LxH output of a state-regulated SSM using a sequential scan.
+
+    At each step t the forgetting strength is adjusted based on three diagnostics
+    computed from the two most recent hidden states:
+
+        r_t  = ||h_{t-1} - h_{t-2}|| / (||h_{t-2}|| + eps)   relative change
+        q_t  = ||h_{t-1}||^2 / (||h_{t-2}||^2 + eps)          energy ratio
+        c_t  = Re(h_{t-1}^H h_{t-2}) / (||h_{t-1}||*||h_{t-2}|| + eps)  cosine sim
+
+    The adaptive damping increment is:
+        g_t  = softplus(W_adapt @ [r_t, q_t, c_t] + b_adapt)   shape (P,)
+
+    and the time-varying state matrix is:
+        A_t  = Lambda_bar * exp(-g_t)
+
+    Because exp(-g_t) in (0, 1] and |Lambda_bar| <= 1 (S5 stability guarantee),
+    |A_t| <= 1 unconditionally.  The update increases damping when the latent
+    state looks disrupted (large r_t, q_t >> 1) and reduces it when the state
+    is stable/aligned (c_t ≈ 1).
+
+    Args:
+        Lambda_bar (complex64): base discretised diagonal state matrix  (P,)
+        B_bar      (complex64): discretised input matrix                (P, H)
+        C_tilde    (complex64): output matrix                           (H, P)
+        W_adapt    (float32):   damping controller weights              (P, 3)
+        b_adapt    (float32):   damping controller bias                 (P,)
+        input_sequence (float32): input features                        (L, H)
+        conj_sym   (bool):     whether conjugate symmetry is enforced
+    Returns:
+        ys (float32): SSM outputs                                       (L, H)
+    """
+    P = Lambda_bar.shape[0]
+    eps = 1e-6
+
+    def step(carry, u_t):
+        h_prev, h_prev2 = carry   # (P,) complex each
+
+        # ---- state diagnostics (all scalar, computed in magnitude space) ----
+        diff_norm  = np.linalg.norm(h_prev - h_prev2)
+        prev2_norm = np.linalg.norm(h_prev2)
+        prev_norm  = np.linalg.norm(h_prev)
+
+        r_t = diff_norm / (prev2_norm + eps)
+        q_t = (prev_norm ** 2) / (prev2_norm ** 2 + eps)
+        c_t = np.real(np.vdot(h_prev, h_prev2)) / (prev_norm * prev2_norm + eps)
+
+        features = np.array([r_t, q_t, c_t])          # (3,)
+
+        # ---- adaptive damping increment (shape P, real, non-negative) -------
+        g_t = jax.nn.softplus(W_adapt @ features + b_adapt)   # (P,)
+
+        # ---- time-varying state matrix: multiplicative decay ----------------
+        # |A_t| = |Lambda_bar| * exp(-g_t) <= |Lambda_bar| <= 1
+        A_t = Lambda_bar * np.exp(-g_t.astype(Lambda_bar.dtype))  # (P,)
+
+        # ---- state update ---------------------------------------------------
+        h_t = A_t * h_prev + B_bar @ u_t.astype(B_bar.dtype)      # (P,)
+
+        # ---- output projection ----------------------------------------------
+        if conj_sym:
+            y_t = 2 * np.real(C_tilde @ h_t)
+        else:
+            y_t = np.real(C_tilde @ h_t)
+
+        return (h_t, h_prev), y_t
+
+    h0 = np.zeros(P, dtype=Lambda_bar.dtype)
+    init_carry = (h0, h0)
+
+    _, ys = jax.lax.scan(step, init_carry, input_sequence)
+    return ys   # (L, H)
+
+
+class AdaptiveDampingS5SSM(S5SSM):
+    """S5 SSM with state-regulated adaptive damping on the diagonal of A_t.
+
+    Inherits all parameters and discretization logic from S5SSM and adds a
+    small (P × 3) linear controller that maps three scalar state diagnostics
+    (relative change r_t, energy ratio q_t, cosine similarity c_t) to a
+    per-state damping increment g_t >= 0.
+
+    The time-varying discrete state matrix at step t is:
+        A_t = Lambda_bar * exp(-g_t)
+    which is always stable (|A_t| <= |Lambda_bar| <= 1) and recovers the base
+    S5 behaviour when g_t -> 0.
+
+    The model uses a sequential JAX scan (jax.lax.scan) rather than the
+    associative scan used by S5SSM, because the adaptive damping introduces
+    a causal dependency h_{t-1} -> g_t -> A_t that cannot be parallelised.
+    It should be presented as a "state-regulated SSM" or
+    "adaptive-damping SSM", not as a linear SSM.
+
+    Extra parameters added per layer (beyond S5SSM):
+        W_adapt  (float32): controller weight matrix   (P, 3), init zeros
+        b_adapt  (float32): controller bias vector     (P,),   init zeros
+
+    Initialising W_adapt = 0 and b_adapt = 0 gives g_t = softplus(0) ≈ 0.693
+    uniformly, which acts as a mild fixed extra damping at init.  To start
+    closer to vanilla S5, initialise b_adapt to a large negative value
+    (e.g. -3) so that softplus(b_adapt) ≈ 0 and the base Lambda_bar
+    dominates.
+    """
+
+    def setup(self):
+        # Inherit all S5SSM parameter setup (Lambda, B, C, D, log_step, discretize)
+        super().setup()
+
+        # Adaptive damping controller: maps 3 scalar diagnostics -> P damping increments
+        # Initialised so that g_t ≈ 0 at the start (large negative bias).
+        self.W_adapt = self.param("W_adapt",
+                                  lambda rng, shape: np.zeros(shape),
+                                  (self.P, 3))
+        self.b_adapt = self.param("b_adapt",
+                                  lambda rng, shape: np.full(shape, -3.0),
+                                  (self.P,))
+
+    def __call__(self, input_sequence):
+        """
+        Compute the LxH output using sequential adaptive-damping scan.
+        Args:
+            input_sequence (float32): (L, H)
+        Returns:
+            output (float32): (L, H)
+        """
+        ys = apply_ssm_adaptive(
+            self.Lambda_bar,
+            self.B_bar,
+            self.C_tilde,
+            self.W_adapt,
+            self.b_adapt,
+            input_sequence,
+            self.conj_sym,
+        )
+        Du = jax.vmap(lambda u: self.D * u)(input_sequence)
+        return ys + Du
+
+
+def init_AdaptiveDampingS5SSM(H,
+                               P,
+                               Lambda_re_init,
+                               Lambda_im_init,
+                               V,
+                               Vinv,
+                               C_init,
+                               discretization,
+                               dt_min,
+                               dt_max,
+                               conj_sym,
+                               clip_eigs,
+                               bidirectional):
+    """Convenience function to initialise AdaptiveDampingS5SSM.
+    Same arguments as init_S5SSM; bidirectional is accepted but ignored
+    (adaptive sequential scan supports forward direction only)."""
+    return partial(AdaptiveDampingS5SSM,
+                   H=H,
+                   P=P,
+                   Lambda_re_init=Lambda_re_init,
+                   Lambda_im_init=Lambda_im_init,
+                   V=V,
+                   Vinv=Vinv,
+                   C_init=C_init,
+                   discretization=discretization,
+                   dt_min=dt_min,
+                   dt_max=dt_max,
+                   conj_sym=conj_sym,
+                   clip_eigs=clip_eigs,
+                   bidirectional=bidirectional)
+
+
 def init_S5SSM(H,
                P,
                Lambda_re_init,
