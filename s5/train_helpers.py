@@ -146,14 +146,16 @@ def create_train_state(model_cls,
         if dt_global:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["B", "Lambda_re", "Lambda_im", "norm"]
+                if k in ["B", "Lambda_re", "Lambda_im", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in [] else "regular")
             )
 
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["B", "Lambda_re", "Lambda_im", "log_step", "norm"]
+                if k in ["B", "Lambda_re", "Lambda_im", "log_step", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in [] else "regular")
             )
         tx = optax.multi_transform(
@@ -173,14 +175,16 @@ def create_train_state(model_cls,
         if dt_global:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "norm"]
+                if k in ["Lambda_re", "Lambda_im", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in ["B"] else "regular")
             )
 
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "log_step", "norm"]
+                if k in ["Lambda_re", "Lambda_im", "log_step", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in ["B"] else "regular")
             )
         tx = optax.multi_transform(
@@ -202,13 +206,15 @@ def create_train_state(model_cls,
         if dt_global:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "norm"]
+                if k in ["Lambda_re", "Lambda_im", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in [] else "regular")
             )
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "log_step", "norm"]
+                if k in ["Lambda_re", "Lambda_im", "log_step", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in [] else "regular")
             )
         tx = optax.multi_transform(
@@ -230,14 +236,16 @@ def create_train_state(model_cls,
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
                 if k in ["B", "C", "C1", "C2", "D",
-                         "Lambda_re", "Lambda_im", "norm"]
+                         "Lambda_re", "Lambda_im", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in [] else "regular")
             )
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
                 if k in ["B", "C", "C1", "C2", "D",
-                         "Lambda_re", "Lambda_im", "log_step", "norm"]
+                         "Lambda_re", "Lambda_im", "log_step", "norm",
+                         "W_adapt", "b_adapt"]
                 else ("none" if k in [] else "regular")
             )
         tx = optax.multi_transform(

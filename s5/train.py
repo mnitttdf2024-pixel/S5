@@ -8,7 +8,7 @@ from .train_helpers import create_train_state, reduce_lr_on_plateau,\
     linear_warmup, cosine_annealing, constant_lr, train_epoch, validate
 from .dataloading import Datasets
 from .seq_model import BatchClassificationModel, RetrievalModel
-from .ssm import init_S5SSM
+from .ssm import init_S5SSM, init_AdaptiveDampingS5SSM
 from .ssm_init import make_DPLR_HiPPO
 
 
@@ -93,19 +93,22 @@ def train(args):
     print("V.shape={}".format(V.shape))
     print("Vinv.shape={}".format(Vinv.shape))
 
-    ssm_init_fn = init_S5SSM(H=args.d_model,
-                             P=ssm_size,
-                             Lambda_re_init=Lambda.real,
-                             Lambda_im_init=Lambda.imag,
-                             V=V,
-                             Vinv=Vinv,
-                             C_init=args.C_init,
-                             discretization=args.discretization,
-                             dt_min=args.dt_min,
-                             dt_max=args.dt_max,
-                             conj_sym=args.conj_sym,
-                             clip_eigs=args.clip_eigs,
-                             bidirectional=args.bidirectional)
+    ssm_init_cls = init_AdaptiveDampingS5SSM if args.use_adaptive_damping else init_S5SSM
+    if args.use_adaptive_damping:
+        print("[*] Using AdaptiveDampingS5SSM (state-regulated damping)")
+    ssm_init_fn = ssm_init_cls(H=args.d_model,
+                               P=ssm_size,
+                               Lambda_re_init=Lambda.real,
+                               Lambda_im_init=Lambda.imag,
+                               V=V,
+                               Vinv=Vinv,
+                               C_init=args.C_init,
+                               discretization=args.discretization,
+                               dt_min=args.dt_min,
+                               dt_max=args.dt_max,
+                               conj_sym=args.conj_sym,
+                               clip_eigs=args.clip_eigs,
+                               bidirectional=args.bidirectional)
 
     if retrieval:
         # Use retrieval head for AAN task
