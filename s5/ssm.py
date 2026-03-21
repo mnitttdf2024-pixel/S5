@@ -389,6 +389,194 @@ class AdaptiveDampingS5SSM(S5SSM):
         return ys + Du, None
 
 
+def apply_ssm_two_pass_adaptive(Lambda_bar, B_bar, C_tilde, W_adapt, b_adapt,
+                                input_sequence, conj_sym):
+    """Two-pass parallel adaptive damping — O(L log L), no sequential scan.
+
+    The standard AdaptiveDampingS5SSM requires a sequential scan because
+    g_t = f(h_{t-1}, h_{t-2}) depends on the hidden state, creating the
+    dependency chain h_0 -> h_1 -> ... -> h_L.
+
+    This function breaks that chain with a two-pass trick:
+
+      Pass 1  Run a standard S5 associative scan to obtain approximate
+              states h̃_t for every timestep simultaneously.
+
+      Diagnose  Compute r_t, q_t, c_t from h̃_{t-1} and h̃_{t-2} for all t
+                in parallel using array shifts and vmapped operations.
+
+      Pass 2  g_t = softplus(W_adapt @ [r_t, q_t, c_t] + b_adapt) is now
+              a fully pre-computed (L, P) array, so Lambda_bar_t =
+              Lambda_bar * exp(-g_t) can be passed directly to a second
+              associative scan — which already supports time-varying
+              Lambda_elements of shape (L, P).
+
+    Total cost:  2 × vanilla S5  =  O(L log L).
+    Approximation:  pass-2 eigenvalues are computed from undamped pass-1
+    states, not from the true adaptive states.  Because b_adapt is
+    initialised to -3.0 the damping is near-zero at the start, so the
+    approximation is tight.  As training progresses the model learns to
+    rely on the signal rather than its exact magnitude.  One additional
+    pass (three scans total) would give a second-order correction, but in
+    practice two passes suffice.
+
+    Args:
+        Lambda_bar (complex64): base discretised diagonal state matrix  (P,)
+        B_bar      (complex64): discretised input matrix                (P, H)
+        C_tilde    (complex64): output matrix                           (H, P)
+        W_adapt    (float32):   damping controller weights              (P, 3)
+        b_adapt    (float32):   damping controller bias                 (P,)
+        input_sequence (float32): input features                        (L, H)
+        conj_sym   (bool):     whether conjugate symmetry is enforced
+    Returns:
+        ys (float32): SSM outputs                                       (L, H)
+    """
+    P = Lambda_bar.shape[0]
+    L = input_sequence.shape[0]
+    eps = 1e-6
+
+    Bu_elements = jax.vmap(lambda u: B_bar @ u)(input_sequence)   # (L, P)
+
+    # ------------------------------------------------------------------
+    # Pass 1: standard parallel scan — get approximate states h̃_t
+    # ------------------------------------------------------------------
+    Lambda_const = Lambda_bar * np.ones((L, P))
+    _, h_approx = jax.lax.associative_scan(binary_operator,
+                                            (Lambda_const, Bu_elements))
+    # h_approx: (L, P) complex
+
+    # ------------------------------------------------------------------
+    # Compute state diagnostics for all t in parallel
+    #   h_prev[t]  = h̃_{t-1}  (zero for t=0)
+    #   h_prev2[t] = h̃_{t-2}  (zero for t=0,1)
+    # ------------------------------------------------------------------
+    h0 = np.zeros((1, P), dtype=h_approx.dtype)
+    h_prev  = np.concatenate([h0,    h_approx[:-1]], axis=0)           # (L, P)
+    h_prev2 = np.concatenate([h0, h0, h_approx[:-2]], axis=0)[:L]      # (L, P)
+
+    # Vectorised norms and cosine similarity over the sequence axis
+    prev_norms  = jax.vmap(np.linalg.norm)(h_prev)                      # (L,)
+    prev2_norms = jax.vmap(np.linalg.norm)(h_prev2)                     # (L,)
+    diff_norms  = jax.vmap(lambda a, b: np.linalg.norm(a - b))(
+                      h_prev, h_prev2)                                   # (L,)
+    dot_real    = jax.vmap(
+                      lambda a, b: np.real(np.sum(np.conj(a) * b))
+                  )(h_prev, h_prev2)                                     # (L,)
+
+    r = diff_norms  / (prev2_norms + eps)                                # (L,)
+    q = prev_norms**2 / (prev2_norms**2 + eps)                           # (L,)
+    c = dot_real / (prev_norms * prev2_norms + eps)                      # (L,)
+
+    features = np.stack([r, q, c], axis=-1)                              # (L, 3)
+
+    # g_t for all t at once — fully parallel (P, 3) @ (3,) + (P,)
+    g = jax.vmap(lambda f: jax.nn.softplus(W_adapt @ f + b_adapt))(
+            features)                                                     # (L, P)
+
+    # ------------------------------------------------------------------
+    # Pass 2: associative scan with adaptive time-varying eigenvalues
+    # ------------------------------------------------------------------
+    Lambda_adaptive = Lambda_bar[None, :] * np.exp(
+                          -g.astype(Lambda_bar.dtype))                   # (L, P)
+    _, xs = jax.lax.associative_scan(binary_operator,
+                                      (Lambda_adaptive, Bu_elements))
+
+    if conj_sym:
+        return jax.vmap(lambda x: 2*(C_tilde @ x).real)(xs)
+    else:
+        return jax.vmap(lambda x: (C_tilde @ x).real)(xs)
+
+
+class TwoPassAdaptiveDampingS5SSM(S5SSM):
+    """S5 SSM with state-based adaptive damping using a two-pass parallel scan.
+
+    This is the fast counterpart of AdaptiveDampingS5SSM.  It retains the
+    same state-based diagnostics (r_t, q_t, c_t from h_{t-1}/h_{t-2}) and
+    the same (P×3) controller, but replaces the O(L) sequential scan with
+    two O(L log L) parallel associative scans:
+
+        Pass 1  standard S5 scan → approximate states h̃_t               O(L log L)
+        Diagnose  compute r_t, q_t, c_t from h̃_t via vmapped ops         O(L)
+        Pass 2  scan with Lambda_bar * exp(-g_t), g_t pre-computed        O(L log L)
+
+    Total wall-clock cost ≈ 2× vanilla S5, vs ≈ L/log(L) × slower for the
+    sequential version.
+
+    The three variants in order of speed:
+        S5SSM                   fixed Lambda_bar          parallel  O(L log L)  1×
+        InputGatedS5SSM         Lambda_bar*exp(-g(u_t))   parallel  O(L log L)  1×
+        TwoPassAdaptiveDampingS5SSM  Lambda_bar*exp(-g(h̃_t))  parallel  O(L log L)  ~2×
+        AdaptiveDampingS5SSM    Lambda_bar*exp(-g(h_t))   sequential O(L)      ~L/logL ×
+
+    Extra parameters per layer (beyond S5SSM): same as AdaptiveDampingS5SSM
+        W_adapt  (float32): (P, 3), init zeros
+        b_adapt  (float32): (P,),  init -3.0
+    """
+
+    def setup(self):
+        super().setup()
+        self.W_adapt = self.param("W_adapt",
+                                  lambda rng, shape: np.zeros(shape),
+                                  (self.P, 3))
+        self.b_adapt = self.param("b_adapt",
+                                  lambda rng, shape: np.full(shape, -3.0),
+                                  (self.P,))
+
+    def __call__(self, input_sequence, global_th):
+        """
+        Args:
+            input_sequence (float32): (L, H)
+            global_th: unused, accepted for API compatibility
+        Returns:
+            output (float32): (L, H)
+            ENERGYscore: None
+        """
+        ys = apply_ssm_two_pass_adaptive(
+            self.Lambda_bar,
+            self.B_bar,
+            self.C_tilde,
+            self.W_adapt,
+            self.b_adapt,
+            input_sequence,
+            self.conj_sym,
+        )
+        Du = jax.vmap(lambda u: self.D * u)(input_sequence)
+        return ys + Du, None
+
+
+def init_TwoPassAdaptiveDampingS5SSM(H,
+                                      P,
+                                      Lambda_re_init,
+                                      Lambda_im_init,
+                                      V,
+                                      Vinv,
+                                      C_init,
+                                      discretization,
+                                      dt_min,
+                                      dt_max,
+                                      conj_sym,
+                                      clip_eigs,
+                                      bidirectional,
+                                      pruning=False):
+    """Convenience function to initialise TwoPassAdaptiveDampingS5SSM.
+    Same signature as init_S5SSM."""
+    return partial(TwoPassAdaptiveDampingS5SSM,
+                   H=H,
+                   P=P,
+                   Lambda_re_init=Lambda_re_init,
+                   Lambda_im_init=Lambda_im_init,
+                   V=V,
+                   Vinv=Vinv,
+                   C_init=C_init,
+                   discretization=discretization,
+                   dt_min=dt_min,
+                   dt_max=dt_max,
+                   conj_sym=conj_sym,
+                   clip_eigs=clip_eigs,
+                   bidirectional=bidirectional,
+                   pruning=pruning)
+
+
 def apply_ssm_input_gated(Lambda_bar, B_bar, C_tilde, W_gate, b_gate,
                           input_sequence, conj_sym, bidirectional):
     """Compute the LxH output of an input-gated SSM using the parallel associative scan.

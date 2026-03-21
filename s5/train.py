@@ -8,7 +8,8 @@ from .train_helpers import create_train_state, reduce_lr_on_plateau,\
     linear_warmup, cosine_annealing, constant_lr, train_epoch, validate
 from .dataloading import Datasets
 from .seq_model import BatchClassificationModel, RetrievalModel
-from .ssm import init_S5SSM, init_AdaptiveDampingS5SSM, init_InputGatedS5SSM
+from .ssm import (init_S5SSM, init_AdaptiveDampingS5SSM,
+                  init_InputGatedS5SSM, init_TwoPassAdaptiveDampingS5SSM)
 from .ssm_init import make_DPLR_HiPPO
 
 
@@ -93,14 +94,20 @@ def train(args):
     print("V.shape={}".format(V.shape))
     print("Vinv.shape={}".format(Vinv.shape))
 
-    if args.adaptive_damping and args.input_gated:
-        raise ValueError("--adaptive_damping and --input_gated are mutually exclusive.")
+    flags = [args.adaptive_damping, args.input_gated,
+             getattr(args, 'two_pass_adaptive', False)]
+    if sum(flags) > 1:
+        raise ValueError("--adaptive_damping, --input_gated, and "
+                         "--two_pass_adaptive are mutually exclusive.")
     if args.adaptive_damping:
         ssm_init_cls = init_AdaptiveDampingS5SSM
-        print("[*] Using AdaptiveDampingS5SSM (state-based sequential damping)")
+        print("[*] Using AdaptiveDampingS5SSM (state-based sequential)")
     elif args.input_gated:
         ssm_init_cls = init_InputGatedS5SSM
-        print("[*] Using InputGatedS5SSM (input-based parallel damping)")
+        print("[*] Using InputGatedS5SSM (input-based parallel)")
+    elif getattr(args, 'two_pass_adaptive', False):
+        ssm_init_cls = init_TwoPassAdaptiveDampingS5SSM
+        print("[*] Using TwoPassAdaptiveDampingS5SSM (state-based 2-pass parallel)")
     else:
         ssm_init_cls = init_S5SSM
     ssm_init_fn = ssm_init_cls(H=args.d_model,

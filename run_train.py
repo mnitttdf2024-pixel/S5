@@ -103,6 +103,16 @@ if __name__ == "__main__":
 							 "controller that adjusts per-state forgetting strength "
 							 "from latent stability diagnostics (r_t, q_t, c_t). "
 							 "Uses sequential jax.lax.scan instead of associative scan.")
+	parser.add_argument("--two_pass_adaptive", type=str2bool, default=False,
+						help="Use TwoPassAdaptiveDampingS5SSM: state-based adaptive "
+							 "damping (same r_t/q_t/c_t diagnostics as "
+							 "--adaptive_damping) but implemented with two parallel "
+							 "associative scans instead of a sequential scan. "
+							 "Pass 1 produces approximate states h̃_t; diagnostics "
+							 "are computed from h̃_t in parallel; Pass 2 runs the "
+							 "associative scan with pre-computed Lambda_bar*exp(-g_t). "
+							 "Cost ~2x vanilla S5 vs ~L/logL x for sequential. "
+							 "Mutually exclusive with --adaptive_damping/--input_gated.")
 	parser.add_argument("--input_gated", type=str2bool, default=False,
 						help="Use InputGatedS5SSM: input-dependent adaptive damping "
 							 "that retains the O(L log L) parallel associative scan. "
