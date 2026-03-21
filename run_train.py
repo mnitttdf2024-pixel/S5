@@ -103,5 +103,14 @@ if __name__ == "__main__":
 							 "controller that adjusts per-state forgetting strength "
 							 "from latent stability diagnostics (r_t, q_t, c_t). "
 							 "Uses sequential jax.lax.scan instead of associative scan.")
+	parser.add_argument("--input_gated", type=str2bool, default=False,
+						help="Use InputGatedS5SSM: input-dependent adaptive damping "
+							 "that retains the O(L log L) parallel associative scan. "
+							 "g_t = softplus(W_gate @ u_t + b_gate) is computed from "
+							 "the input u_t before the scan, so Lambda_bar_t = "
+							 "Lambda_bar * exp(-g_t) can be pre-computed for all t "
+							 "in parallel. Equivalent to Mamba-style selective "
+							 "forgetting on the decay magnitude only. "
+							 "Mutually exclusive with --adaptive_damping.")
 
 	train(parser.parse_args())

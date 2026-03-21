@@ -389,6 +389,170 @@ class AdaptiveDampingS5SSM(S5SSM):
         return ys + Du, None
 
 
+def apply_ssm_input_gated(Lambda_bar, B_bar, C_tilde, W_gate, b_gate,
+                          input_sequence, conj_sym, bidirectional):
+    """Compute the LxH output of an input-gated SSM using the parallel associative scan.
+
+    This is the parallel counterpart of apply_ssm_adaptive.  Instead of deriving
+    the per-step damping from the hidden states h_{t-1} / h_{t-2} (which requires a
+    sequential scan), it derives it directly from the current input u_t:
+
+        g_t  = softplus(W_gate @ u_t + b_gate)     shape (P,), all t in parallel
+        A_t  = Lambda_bar * exp(-g_t)               shape (P,), time-varying
+
+    Because g_t depends only on u_t — which is available for every timestep before
+    the scan begins — the time-varying Lambda_elements array of shape (L, P) can be
+    fully pre-computed.  The existing associative binary operator then handles the
+    time-varying diagonal naturally (it already computes A_j * A_i per element), so
+    the full O(L log L) parallel scan is preserved.
+
+    Connection to Mamba/S6:  Mamba computes A_t = exp(Lambda * Delta_t) where
+    Delta_t = softplus(W_delta @ u_t).  This function is equivalent to that with the
+    specific form  exp(Lambda * Delta) * exp(-softplus(W_gate @ u_t)),  i.e. the
+    fixed discretised eigenvalue is multiplicatively corrected by an input-dependent
+    damping factor — retaining the HiPPO initialisation of Lambda while adding
+    selective forgetting.
+
+    Stability:  |A_t| = |Lambda_bar| * exp(-g_t) <= |Lambda_bar| <= 1  always,
+    because g_t >= 0.
+
+    Args:
+        Lambda_bar (complex64): base discretised diagonal state matrix  (P,)
+        B_bar      (complex64): discretised input matrix                (P, H)
+        C_tilde    (complex64): output matrix                           (H, P) or (H, 2P)
+        W_gate     (float32):   input-to-gate weight matrix             (P, H)
+        b_gate     (float32):   gate bias                               (P,)
+        input_sequence (float32): input features                        (L, H)
+        conj_sym   (bool):     whether conjugate symmetry is enforced
+        bidirectional (bool):  whether bidirectional setup is used
+    Returns:
+        ys (float32): SSM outputs                                       (L, H)
+    """
+    # Pre-compute per-step damping from input — shape (L, P), fully parallel
+    g = jax.vmap(lambda u: jax.nn.softplus(W_gate @ u + b_gate))(input_sequence)  # (L, P)
+
+    # Time-varying state matrix: multiply base Lambda_bar by exp(-g_t) element-wise
+    # Cast g to complex so the multiplication is type-safe with Lambda_bar (complex64)
+    Lambda_elements = Lambda_bar[None, :] * np.exp(-g.astype(Lambda_bar.dtype))   # (L, P)
+
+    Bu_elements = jax.vmap(lambda u: B_bar @ u)(input_sequence)                   # (L, P)
+
+    _, xs = jax.lax.associative_scan(binary_operator, (Lambda_elements, Bu_elements))
+
+    if bidirectional:
+        _, xs2 = jax.lax.associative_scan(binary_operator,
+                                          (Lambda_elements, Bu_elements),
+                                          reverse=True)
+        xs = np.concatenate((xs, xs2), axis=-1)
+
+    if conj_sym:
+        return jax.vmap(lambda x: 2*(C_tilde @ x).real)(xs)
+    else:
+        return jax.vmap(lambda x: (C_tilde @ x).real)(xs)
+
+
+class InputGatedS5SSM(S5SSM):
+    """S5 SSM with input-dependent adaptive damping, retaining the parallel associative scan.
+
+    Replaces the fixed Lambda_bar with a time-varying A_t computed as:
+
+        g_t  = softplus(W_gate @ u_t + b_gate)   (P,) per timestep
+        A_t  = Lambda_bar * exp(-g_t)             (P,) per timestep
+
+    Because g_t depends only on the current input u_t (not on the hidden state),
+    the full (L, P) sequence of time-varying eigenvalues can be pre-computed in
+    parallel before the associative scan, so the O(L log L) complexity of S5 is
+    preserved — unlike AdaptiveDampingS5SSM which uses a sequential scan.
+
+    Relationship to the two variants
+    ---------------------------------
+    AdaptiveDampingS5SSM  uses [r_t, q_t, c_t] from h_{t-1}/h_{t-2}  →  state-based,
+                          more principled, but requires sequential O(L) scan.
+    InputGatedS5SSM       uses W_gate @ u_t                            →  input-based,
+                          parallel O(L log L) scan, same speed as vanilla S5.
+
+    The input-based signal is a natural proxy: if u_t is a large disruption, the SSM
+    state will likely be disrupted too.  This is the same logic Mamba/S6 uses for
+    selective forgetting — the difference is that here only the decay magnitude is
+    modulated (not B or the full Delta), keeping the HiPPO eigenvalue structure intact.
+
+    Extra parameters per layer (beyond S5SSM):
+        W_gate  (float32): input-to-gate weights  (P, H), init zeros
+        b_gate  (float32): gate bias              (P,),   init -3.0
+
+    With b_gate = -3.0: softplus(-3) ≈ 0.05, exp(-0.05) ≈ 0.95, so the model
+    starts very close to vanilla S5 and learns to gate selectively.
+    """
+
+    def setup(self):
+        super().setup()
+
+        # W_gate maps H input features to P per-state damping values.
+        # Zero init + large negative bias → near-zero extra damping at start.
+        self.W_gate = self.param("W_gate",
+                                 lambda rng, shape: np.zeros(shape),
+                                 (self.P, self.H))
+        self.b_gate = self.param("b_gate",
+                                 lambda rng, shape: np.full(shape, -3.0),
+                                 (self.P,))
+
+    def __call__(self, input_sequence, global_th):
+        """
+        Compute the LxH output using the parallel input-gated scan.
+        Args:
+            input_sequence (float32): (L, H)
+            global_th: pruning threshold (unused; accepted for API compatibility)
+        Returns:
+            output (float32): (L, H)
+            ENERGYscore: None (input gating does not use AIRE scoring)
+        """
+        ys = apply_ssm_input_gated(
+            self.Lambda_bar,
+            self.B_bar,
+            self.C_tilde,
+            self.W_gate,
+            self.b_gate,
+            input_sequence,
+            self.conj_sym,
+            self.bidirectional,
+        )
+        Du = jax.vmap(lambda u: self.D * u)(input_sequence)
+        return ys + Du, None
+
+
+def init_InputGatedS5SSM(H,
+                          P,
+                          Lambda_re_init,
+                          Lambda_im_init,
+                          V,
+                          Vinv,
+                          C_init,
+                          discretization,
+                          dt_min,
+                          dt_max,
+                          conj_sym,
+                          clip_eigs,
+                          bidirectional,
+                          pruning=False):
+    """Convenience function to initialise InputGatedS5SSM.
+    Same signature as init_S5SSM / init_AdaptiveDampingS5SSM."""
+    return partial(InputGatedS5SSM,
+                   H=H,
+                   P=P,
+                   Lambda_re_init=Lambda_re_init,
+                   Lambda_im_init=Lambda_im_init,
+                   V=V,
+                   Vinv=Vinv,
+                   C_init=C_init,
+                   discretization=discretization,
+                   dt_min=dt_min,
+                   dt_max=dt_max,
+                   conj_sym=conj_sym,
+                   clip_eigs=clip_eigs,
+                   bidirectional=bidirectional,
+                   pruning=pruning)
+
+
 def init_AdaptiveDampingS5SSM(H,
                                P,
                                Lambda_re_init,
